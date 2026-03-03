@@ -1,23 +1,24 @@
-# Characterizing Pattern Matching and Its Limits on Compositional Task Structures
+# Characterizing Pattern Matching and Its Limits on Compositional Task Structures (ICLR 2026)
 
-This repository contains code for **[“Characterizing Pattern Matching and Its Limits on Compositional Task Structures”](https://www.arxiv.org/abs/2505.20278?context=cs.AI)** The codes are built upon the [GrokkedTransformer repository](https://github.com/OSU-NLP-Group/GrokkedTransformer).
+This repository contains code for **[“Characterizing Pattern Matching and Its Limits on Compositional Task Structures”](https://www.arxiv.org/abs/2505.20278v3)** The codes are built upon the [GrokkedTransformer repository](https://github.com/OSU-NLP-Group/GrokkedTransformer).
 
 ## Abstract
 
 Despite impressive capabilities, LLMs' successes often rely on pattern-matching behaviors, yet these are also linked to OOD generalization failures in compositional tasks. However, behavioral studies commonly employ task setups that allow multiple generalization sources (e.g., algebraic invariances, structural repetition), obscuring a precise and testable account of how well LLMs perform generalization through pattern matching and their limitations. To address this ambiguity, we first formalize pattern matching as functional equivalence, i.e., identifying pairs of subsequences of inputs that consistently lead to identical results when the rest of the input is held constant. Then, we systematically study how decoder-only Transformer and Mamba behave in controlled tasks with compositional structures that isolate this mechanism. Our formalism yields predictive and quantitative insights: (1) Instance-wise success of pattern matching is well predicted by the number of contexts witnessing the relevant functional equivalence. (2) We prove a tight sample complexity bound of learning a two-hop structure by identifying the exponent of the data scaling law for perfect in-domain generalization. Our empirical results align with the theoretical prediction, under 20x parameter scaling and across architectures. (3) Path ambiguity is a structural barrier: when a variable influences the output via multiple paths, models fail to form unified intermediate state representations, impairing accuracy and interpretability. (4) Chain-of-Thought reduces data requirements yet does not resolve path ambiguity. Hence, we provide a predictive, falsifiable boundary for pattern matching and a foundational diagnostic for disentangling mixed generalization mechanisms.
 
 ## File Structure
-```
+
+```text
 coverage-principle/
-├── dataset\_generation/: scripts for training/evaluation data generation
+├── dataset_generation/: scripts for training/evaluation data generation
 ├── data/: cached training/evaluation data
 ├── main.py: main script for model training
-├── determine\_coverage.py: coverage determination algorithm
-└── circuit\_analysis/: cosine similarity and causal tracing analysis
-
-````
+├── determine_coverage.py: coverage determination algorithm
+└── circuit_analysis/: cosine similarity and causal tracing analysis
+```
 
 ## Environmental Setup
+
 ```bash
 conda create -n coverage-principle python=3.10
 conda activate coverage-principle
@@ -27,7 +28,7 @@ pip install torch==1.13.1+cu116 torchvision==0.14.1+cu116 torchaudio==0.13.1 tra
 cd simpletransformers
 pip install -e .
 cd ..
-````
+```
 
 ## Data Preparation
 
@@ -40,7 +41,7 @@ cd dataset_generation
 python twohop.py --num_tokens 50 --max_train_data_num 10000 --default_seen_ratio 0.7 --test_size_for_type 2000 --seed 42
 ```
 
-**Key arguments**
+### Key arguments for `dataset_generation/[...].py`
 
 | Argument               | Description                                           |
 | ---------------------- | ----------------------------------------------------- |
@@ -62,18 +63,30 @@ This creates a dataset in `data/twohop.50.10000.diff-f12.inf/` containing:
 To analyze which test examples fall within the coverage of your training data:
 
 ```bash
-python determine_coverage.py --data_dir data/twohop.50.10000.diff-f12.inf/ --min_evidence 1 --k_sweep
+# General $k$ value analysis (k=1,...,8), for all nonempty proper subsets of indices:
+python determine_coverage.py --data_dir data/twohop.50.10000.diff-f12.inf/ --k_sweep --max_k 8
+# If you want to analyze coverage specifically for a fixed index set (here, I={1,2}):
+python determine_coverage.py --data_dir data/twohop.50.10000.diff-f12.inf/ --k_sweep --target_indices 0 1
 ```
 
-**Key arguments**
+### Coverage visualization
+
+You can visualize the coverage using graph-drawing tools, for a specific value of *k*:
+
+```bash
+# Activate visualization tools with k=3:
+python determine_coverage.py --data_dir data/twohop.50.10000.diff-f12.inf/ --min_evidence 3 --visualise
+```
+
+### Key arguments for `determine_coverage.py`
 
 | Argument         | Description                                               |
 | ---------------- | --------------------------------------------------------- |
 | `--data_dir`     | Path to dataset directory                                 |
 | `--min_evidence` | Minimum evidence threshold *k* for functional equivalence |
-| `--k_sweep`      | Run analysis for multiple *k* values                      |
 | `--visualise`    | Generate graph visualization of coverage                  |
-| `--ground_truth` | Use ground-truth functional equivalence (f1 only)         |
+| `--k_sweep`      | Run analysis for multiple *k* values                      |
+| `--max_k`        | Maximum *k* value for running analysis with `--k_sweep`   |
 
 Outputs include:
 
@@ -89,7 +102,7 @@ Train a GPT-2 model on the generated dataset:
 bash script/train.sh twohop.50.10000.diff-f12.inf 0.1 8 12 0 42
 ```
 
-**Script arguments**
+### Script arguments
 
 1. Dataset name (e.g., `twohop.50.10000.diff-f12.inf`)
 2. Weight decay (e.g., `0.1`)
@@ -98,7 +111,7 @@ bash script/train.sh twohop.50.10000.diff-f12.inf 0.1 8 12 0 42
 5. GPU ID (e.g., `0`)
 6. Random seed (e.g., `42`)
 
-**Training configuration**
+### Training configuration
 
 * Architecture: GPT-2 with specified layers/heads
 * Learning rate: `8e-4`
@@ -108,7 +121,7 @@ bash script/train.sh twohop.50.10000.diff-f12.inf 0.1 8 12 0 42
 
 Trained models are saved in `CKPT_DIR/trained_checkpoints/`.
 
-## Analysis
+## Analysis of Trained Models
 
 ### Cosine Similarity Analysis
 

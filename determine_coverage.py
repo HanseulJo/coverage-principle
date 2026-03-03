@@ -5,12 +5,9 @@ import json
 import logging
 import os
 from collections import defaultdict
-from itertools import combinations, chain, product
+from itertools import combinations
 from typing import Dict, List, Tuple, Set, FrozenSet
 from tqdm import tqdm
-
-import multiprocessing as mp
-from functools import partial
 
 import networkx as nx
 
@@ -23,7 +20,7 @@ def setup_logging(debug: bool = False) -> None:
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
 
-def parse_input_tokens(s: str) -> Tuple[int, int, int]:
+def parse_input_tokens(s: str) -> Tuple[int,...]:
     return tuple(int(tok.split("_")[-1]) for tok in s.strip("<>").split("><"))
 
 
@@ -33,190 +30,76 @@ def powerset(iterable):
     return [frozenset(subset) for r in range(1, len(s)) for subset in combinations(s, r)]
 
 
-###############################################################################
-# Union–Find for equivalence classes
-###############################################################################
-
-class UnionFind:
-    def __init__(self):
-        self.parent = {}
-        self.size = {}
-
-    def find(self, x):
-        if x not in self.parent:
-            self.parent[x] = x
-            self.size[x] = 1
-            return x
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])
-        return self.parent[x]
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return
-        if self.size[ra] < self.size[rb]:
-            ra, rb = rb, ra
-        self.parent[rb] = ra
-        self.size[ra] += self.size[rb]
-
-
-###############################################################################
-# Build equivalence classes for all possible subsequences
-###############################################################################
-
-def extract_subsequence(full_sequence, indices):
+def extract_subsequence(full_sequence: Tuple[int], indices: FrozenSet[int]):
     """Extract a subsequence from the full sequence using the provided indices."""
     return tuple(full_sequence[i] for i in indices)
-
-
-def build_equiv_classes_for_subset(train_map: Dict[Tuple[int, int, int], int], 
-                                 subset_indices: FrozenSet[int], 
-                                 min_evidence: int = 1) -> UnionFind:
-    """
-    Build equivalence classes for a specific subset of indices.
-    Two subsequences are equivalent if:
-      ⋆ there exist at least 'min_evidence' distinct complements such that both 
-        combinations are in the training data with matching targets, and
-      ⋆ on every complement that appears for both subsequences, the targets match.
-    """
-    # Convert indices from 0-based to 1-based for logging
-    subset_indices_1based = {i+1 for i in subset_indices}
-    logging.debug(f"Building equivalence classes for subset {subset_indices_1based}")
-    
-    # 1) gather behavior for each subsequence
-    # Subsequence -> {Complement -> Target}
-    behavior = defaultdict(dict)
-    complement_indices = frozenset(range(3)) - subset_indices
-    
-    for full_seq, target in train_map.items():
-        subseq = extract_subsequence(full_seq, subset_indices)
-        complement = extract_subsequence(full_seq, complement_indices)
-        behavior[subseq][complement] = target
-    
-    # 2) Count shared evidence and check for contradictions
-    pair_evidence = defaultdict(int)
-    contradictions = set()
-    
-    for (subseq1, compl_map1), (subseq2, compl_map2) in combinations(behavior.items(), 2):
-        # if subseq1 >= subseq2:
-        #     continue
-            
-        # Find shared complements
-        shared_complements = set(compl_map1) & set(compl_map2)
-        
-        # Check for contradictions
-        for comp in shared_complements:
-            if compl_map1[comp] != compl_map2[comp]:
-                contradictions.add(tuple(sorted([subseq1, subseq2])))
-                break
-        
-        # If no contradictions, count matching evidence
-        if tuple(sorted([subseq1, subseq2])) not in contradictions and shared_complements:
-            matching_evidence = sum(1 for comp in shared_complements 
-                                  if compl_map1[comp] == compl_map2[comp])
-            pair_evidence[(subseq1, subseq2)] = matching_evidence
-    
-    # 3) Union subsequences with sufficient evidence
-    uf = UnionFind()
-    
-    for (subseq1, subseq2), evidence_count in pair_evidence.items():
-        if evidence_count >= min_evidence and tuple(sorted([subseq1, subseq2])) not in contradictions:
-            uf.union(subseq1, subseq2)
-    
-    # Initialize all subsequences in the Union-Find structure
-    for subseq in behavior:
-        _ = uf.find(subseq)
-    
-    num_classes = len({uf.find(subseq) for subseq in behavior})
-    logging.info(f"Subset {subset_indices_1based}: {num_classes} equivalence classes from {len(behavior)} subsequences")
-    return uf
-
-
-def build_all_equiv_classes(train_map: Dict[Tuple[int, int, int], int], 
-                           min_evidence: int = 1,
-                           ground_truth: bool = False) -> Dict[FrozenSet[int], UnionFind]:
-    """Build equivalence classes for all possible subsequences."""
-    all_subsets = powerset(range(3)) if not ground_truth else [frozenset((0,1))]  # All non-trivial subsets of {0,1,2}
-    return {subset: build_equiv_classes_for_subset(train_map, subset, min_evidence) 
-            for subset in all_subsets}
 
 
 ###############################################################################
 # Substitution graph & coverage
 ###############################################################################
 
-def build_full_subst_graph(all_triples, triple2t, equiv_classes):
-    """Build substitution graph using the bucketing approach for better alignment with the coverage principle."""
-    G = nx.Graph()
-    for tr in all_triples:
-        G.add_node(tr)
-    
-    # Create buckets based on equivalence classes
-    buckets = defaultdict(list)
-    
-    for tr in all_triples:
-        h1, h2, h3 = tr
-        t = triple2t[tr]
+def get_behavior_map_per_indices(
+    train_map: Dict[Tuple[int,...], int], 
+    behavior_maps,  # thrice-nested mapping; will be updated in this function
+    indices,
+    full_length: int = 3,
+): 
+    if indices not in behavior_maps:
+        # Initialize the behavior map
+        behavior = defaultdict(dict)
         
-        # For each subset of indices we have equivalence classes for
-        for subset_indices in equiv_classes:
-            # Extract the subsequence for this subset
-            subseq = extract_subsequence(tr, subset_indices)
-            
-            # Extract the complement indices and values
-            complement_indices = frozenset(range(3)) - subset_indices
-            complement = extract_subsequence(tr, complement_indices)
-            
-            # Get the equivalence class for this subsequence
-            equiv_class = equiv_classes[subset_indices].find(subseq)
-            
-            # Add to bucket: (equiv_class, complement, target)
-            buckets[(equiv_class, complement, t)].append(tr)
+        for full_seq, target in train_map.items():
+            subseq = tuple(full_seq[i] if i in indices else -1 for i in range(full_length))  # masked full_seq: for convenience in `build_subst_graph`
+            complement = tuple(full_seq[i] for i in range(full_length) if i not in indices)
+            behavior[subseq][complement] = target
+        
+        behavior_maps[indices] = dict(behavior)
     
-    # Connect all pairs in each bucket
-    edge_count = 0
-    for triples in buckets.values():
-        for a, b in combinations(triples, 2):
-            G.add_edge(a, b)
-            edge_count += 1
+    return behavior_maps[indices]
+
+
+def build_subst_graph(
+    behavior_maps: Dict[Tuple[int,...], Dict],  # thrice-nested mapping; assumed to be generated in `get_behavior_map_per_indices`.
+    all_tuples: List[Tuple[int, ...]],
+    min_evidence: int = 1,
+    full_length: int = 3,
+) -> nx.Graph:
+    """Build an indices-specific substitution graph."""
     
-    logging.info(f"Substitution graph: |V|={G.number_of_nodes()}, |E|={edge_count}")
+    G = nx.Graph()
+    for tr in all_tuples:
+        G.add_node(tr)
+        
+    for indices, behavior in behavior_maps.items():
+        indices_complement = sorted(set(range(full_length)) - indices)
+        all_complements = set([tuple(tup[i] for i in indices_complement) for tup in all_tuples])
+
+        for (subseq1, compl_map1), (subseq2, compl_map2) in combinations(behavior.items(), 2):
+            shared_complements = set(compl_map1) & set(compl_map2)  # co-occurrences
+            if len(shared_complements) >= min_evidence:
+                functionally_k_equivalent = True
+                for comp in shared_complements:
+                    if compl_map1[comp] != compl_map2[comp]:
+                        functionally_k_equivalent = False
+                        break
+                if functionally_k_equivalent:  # all co-occurrences (# >= k) are consistent; functionally k-equivalent
+                    seq1, seq2 = list(subseq1), list(subseq2)
+                    for comp in all_complements:
+                        for j, idx in enumerate(indices_complement):
+                            seq1[idx] = seq2[idx] = comp[j]
+                        G.add_edge(tuple(seq1), tuple(seq2))
+    
+    logging.info(f"Substitution graph (indices=): |V|={G.number_of_nodes()}, |E|={G.number_of_edges()}")
     return G
 
-def find_edges_in_batch(batch, triple2t, equiv_classes):
-    """Find all valid edges in a batch of triple pairs."""
-    edges = []
-    
-    for a, b in batch:
-        # Only connect if they have the same target
-        if triple2t[a] != triple2t[b]:
-            continue
-        
-        # For each subset that we have equivalence classes for
-        for subset_indices in equiv_classes:
-            # Check if they differ ONLY on the current subset
-            if all(a[i] == b[i] for i in range(3) if i not in subset_indices) and \
-               any(a[i] != b[i] for i in subset_indices):
-                
-                # Extract the subsequences for this subset
-                subseq_a = extract_subsequence(a, subset_indices)
-                subseq_b = extract_subsequence(b, subset_indices)
-                
-                # Check if they're in the same equivalence class
-                uf = equiv_classes[subset_indices]
-                if uf.find(subseq_a) == uf.find(subseq_b):
-                    edges.append((a, b))
-                    break  # Found a connecting subset, no need to check others
-    
-    return edges
 
-
-def compute_coverage(G: nx.Graph, train_triples: List[Tuple[int, int, int]]) -> Set[Tuple[int, int, int]]:
+def compute_coverage(G: nx.Graph, train_tuples: List[Tuple[int,...]]) -> Set[Tuple[int,...]]:
     covered = set()
-    for tr in train_triples:
+    for tr in train_tuples:
         if tr not in covered:
-            covered.update(nx.node_connected_component(G, tr))
+            conn = nx.node_connected_component(G, tr)
+            covered.update(conn)
     logging.info(f"Covered nodes: {len(covered)}")
     return covered
 
@@ -233,9 +116,11 @@ def main():
     ap.add_argument("--min_evidence", type=int, default=1,
                    help="minimum evidence for equivalence classes")
     ap.add_argument("--k_sweep", action="store_true",
-                   help="Run multiple min_evidence values (1-8) and report coverage")
-    ap.add_argument("--ground_truth", action="store_true",
-                   help="Run multiple min_evidence values (1-8) and report coverage")
+                   help="Run multiple min_evidence values (1..max_k) and report coverage")
+    ap.add_argument("--max_k", type=int, default=8,
+                   help="maximum min_evidence value; used only when `--k_sweep` is activated")
+    ap.add_argument("--target_indices", type=int, nargs="*", default=None,
+                   help="Compute coverage for specific index set (e.g.,`--target_indices 0 1`)")
     args = ap.parse_args()
 
     setup_logging(args.debug)
@@ -244,115 +129,64 @@ def main():
         with open(os.path.join(args.data_dir, name), "r", encoding="utf-8") as f:
             return json.load(f)
 
-    train = jload("train.json")
-    test = jload("test.json")
+    train: List[Dict[str, str]] = jload("train.json")
+    test: List[Dict[str, str]] = jload("test.json")
 
     parse = parse_input_tokens
+    
+    ## Remark - types of test examples (n-hop task):
+    ## `type_0`: all n atmoic facts are observed independently  - candidate elements inside the coverage boundary (≈ "In-Domain Closure")
+    ## `type_m` (m>=1): For binary representation (b1, ..., bn) of (m-1)>=0, the i-th atomic fact is observed iff bi == 1  - necessarily OOD
+    train_tuples = [parse(it["input_text"]) for it in train]
+    test_tuples = [parse(it["input_text"]) for it in test if it["type"] == "type_0"]
+    # test_tuples = [d for d in test_tuples if d not in train_tuples]  # Remove train examples if needed
+    logging.info(f"train tuples: {len(train_tuples)}  test tuples: {len(test_tuples)}")
+    assert len(train_tuples) == len(set(train_tuples)), "duplicate tuples in train.json"
+    assert len(test_tuples) == len(set(test_tuples)), "duplicate tuples in test.json"
 
-    train_triples = [parse(it["input_text"]) for it in train]
-    test_triples = [parse(it["input_text"]) for it in test if it["type"] == "type_0"]
-    # test_triples = [d for d in test_triples if d not in train_triples]  # remove duplicates
-    logging.info(f"train triples: {len(train_triples)}  test triples: {len(test_triples)}")
-    assert len(train_triples) == len(set(train_triples)), "duplicate triples in train.json"
-    assert len(test_triples) == len(set(test_triples)), "duplicate triples in test.json"
+    tuple2t = {parse(it["input_text"]): parse(it["target_text"].replace("</a>", ""))[-1] for it in train + test}  # train_map + test_map
+    train_map = {tr: tuple2t[tr] for tr in train_tuples}
 
-    def label(it):
-        t_tok = it["target_text"].replace("</a>", "").strip("<>").split("><")[-1]
-        return int(t_tok.split("_")[-1])
+    # get `full_len`: (n+1) for n-hop task.
+    for example in tuple2t:
+        full_len = len(example)
+        break
 
-    triple2t = {parse(it["input_text"]): label(it) for it in train + test}
-    train_map = {tr: triple2t[tr] for tr in train_triples}
+    type0_indices = [i for i, item in enumerate(test) if item.get("type") == "type_0"]  # effectively the same as range(len(test)).
+    type0_total = len(type0_indices)
 
+    # Cache the behavior maps for efficiency
+    logging.info("Caching behavior maps for all subsets...")
+    behavior_maps = {}
+    if args.target_indices is None:
+        all_subsets = powerset(range(full_len))
+        for indices in all_subsets:
+            get_behavior_map_per_indices(train_map, behavior_maps, indices, full_len)
+    else:  # args.target_indices: List[int,...]
+        get_behavior_map_per_indices(train_map, behavior_maps, frozenset(args.target_indices), full_len)
+        target_indices_strs = ",".join(map(str, args.target_indices))
 
     if args.k_sweep:
         k_sweep_results = {}
         
         # For tracking coverage of each example at each k
         # Map from test example index to highest k where it's covered
-        type0_indices = [i for i, item in enumerate(test) if item.get("type") == "type_0"]
         coverage_by_example = {i: 0 for i in type0_indices}  # Default to uncovered
         
-        # Cache the behavior maps for efficiency
-        logging.info("Caching behavior maps for all subsets (will speed up k-sweep)...")
-        behavior_maps = {}
-        
-        # This function extracts and caches the behavior map for a subset
-        def get_behavior_map(subset_indices):
-            if subset_indices not in behavior_maps:
-                # Initialize the behavior map
-                behavior = defaultdict(dict)
-                complement_indices = frozenset(range(3)) - subset_indices
-                
-                for full_seq, target in train_map.items():
-                    subseq = extract_subsequence(full_seq, subset_indices)
-                    complement = extract_subsequence(full_seq, complement_indices)
-                    behavior[subseq][complement] = target
-                
-                behavior_maps[subset_indices] = behavior
-            
-            return behavior_maps[subset_indices]
-        
-        # Pre-compute all behavior maps
-        all_subsets = powerset(range(3)) if not args.ground_truth else [frozenset((0,1))]
-        for subset in all_subsets:
-            _ = get_behavior_map(subset)
-        
         # Run the k-sweep
-        from tqdm import tqdm
-        k_values = range(1, 21)  # k from 1 to 8
+        k_values = range(1, args.max_k+1)
         
-        for k in tqdm(k_values, desc="K-sweep progress"):
+        for k in tqdm(k_values, desc="k-sweep progress"):
             logging.info(f"Running coverage analysis with min_evidence = {k}")
             
-            # Build equivalence classes with behavior maps and current k
-            equiv_classes = {}
-            for subset in all_subsets:
-                behavior = behavior_maps[subset]
-                
-                # Initialize UnionFind
-                uf = UnionFind()
-                
-                # Count shared evidence and check for contradictions
-                pair_evidence = defaultdict(int)
-                contradictions = set()
-                
-                for (subseq1, compl_map1), (subseq2, compl_map2) in combinations(behavior.items(), 2):
-                    # Find shared complements
-                    shared_complements = set(compl_map1) & set(compl_map2)
-                    
-                    # Check for contradictions
-                    for comp in shared_complements:
-                        if compl_map1[comp] != compl_map2[comp]:
-                            contradictions.add(tuple(sorted([subseq1, subseq2])))
-                            break
-                    
-                    # If no contradictions, count matching evidence
-                    if tuple(sorted([subseq1, subseq2])) not in contradictions and shared_complements:
-                        matching_evidence = sum(1 for comp in shared_complements 
-                                            if compl_map1[comp] == compl_map2[comp])
-                        pair_evidence[(subseq1, subseq2)] = matching_evidence
-                
-                # Union subsequences with sufficient evidence
-                for (subseq1, subseq2), evidence_count in pair_evidence.items():
-                    if evidence_count >= k and tuple(sorted([subseq1, subseq2])) not in contradictions:
-                        uf.union(subseq1, subseq2)
-                
-                # Initialize all subsequences in the UnionFind structure
-                for subseq in behavior:
-                    _ = uf.find(subseq)
-                
-                equiv_classes[subset] = uf
-            
             # Build graph and compute coverage
-            G = build_full_subst_graph(train_triples + test_triples, triple2t, equiv_classes)
-            covered = compute_coverage(G, train_triples)
-            
+            G = build_subst_graph(behavior_maps, train_tuples + test_tuples, k, full_length=full_len)
+            covered = compute_coverage(G, train_tuples)
+
             # Count coverage for type_0 and track individual test examples
-            type0_total = 0
             type0_covered = 0
             
             for i in type0_indices:
-                type0_total += 1
                 if parse(test[i]["input_text"]) in covered:
                     type0_covered += 1
                     # Update this example's coverage threshold to current k
@@ -366,15 +200,15 @@ def main():
         
         # Write results to JSON file
         os.makedirs("k_sweep_results", exist_ok=True)
-        k_sweep_file = os.path.join("k_sweep_results", f"{args.data_dir.split('/')[-2]}{'_ground-truth' if args.ground_truth else ''}.json")
+        k_sweep_file = os.path.join("k_sweep_results", f"{args.data_dir.split('/')[-2]}{'_full' if args.target_indices is None else '_I='+target_indices_strs}.json")
         with open(k_sweep_file, "w", encoding="utf-8") as f:
             json.dump(k_sweep_results, f, indent=2)
         
-        logging.info(f"K-sweep results written to {k_sweep_file}")
+        logging.info(f"k-sweep results written to {k_sweep_file}")
         
         # Create modified test data with coverage thresholds
         new_test_data = test.copy()
-        coverage_threshold_counts = {i: 0 for i in range(9)}  # Count examples for each threshold
+        coverage_threshold_counts = {i: 0 for i in range(args.max_k+1)}  # Count examples for each threshold
         
         # Create entries with coverage threshold types
         for i in type0_indices:
@@ -387,7 +221,7 @@ def main():
             new_test_data.append(duplicate_entry)
         
         # Write the modified test file
-        threshold_test_file = os.path.join(args.data_dir, f"test_annotated{'_ground-truth' if args.ground_truth else ''}.json")
+        threshold_test_file = os.path.join(args.data_dir, f"test_annotated{'_full' if args.target_indices is None else '_I='+target_indices_strs}.json")
         with open(threshold_test_file, "w", encoding="utf-8") as f:
             json.dump(new_test_data, f, indent=2)
         
@@ -397,23 +231,14 @@ def main():
             logging.info(f"  covered_{threshold}: {count} examples")
         
         logging.info(f"Enhanced test data with coverage thresholds written to {threshold_test_file}")
-    
-
-
-
 
 
     else:
-        # Build equivalence classes for all possible subsequences
-        equiv_classes = build_all_equiv_classes({tr: triple2t[tr] for tr in train_triples}, 
-                                            min_evidence=args.min_evidence,
-                                            ground_truth=args.ground_truth)
-        
         # Build full substitution graph
-        G = build_full_subst_graph(train_triples + test_triples, triple2t, equiv_classes)
-        
+        G = build_subst_graph(behavior_maps, train_tuples + test_tuples, args.min_evidence, full_length=full_len)
+
         # Compute coverage
-        covered = compute_coverage(G, train_triples)
+        covered = compute_coverage(G, train_tuples)
 
         # Annotate test.json
         for it in test:
@@ -434,7 +259,7 @@ def main():
             logging.info(f"Coverage [{typ}] : {hits[typ]} / {totals[typ]}  ({pct:.2f}%)")
 
         # Write annotated test file with appropriate suffix
-        annotated_file = os.path.join(args.data_dir, f"test_annotated{'_ground-truth' if args.ground_truth else '_full'}.json")
+        annotated_file = os.path.join(args.data_dir, f"test_annotated{'_full' if args.target_indices is None else '_I='+target_indices_strs}.json")
         with open(annotated_file, "w", encoding="utf-8") as f:
             json.dump(test, f, indent=2)
         logging.info(f"{annotated_file} written")
@@ -442,23 +267,23 @@ def main():
         # Visualization logic
         if args.visualise:
             # ------------------------------------------------------------------
-            # 1.  keep only the triples we want to see
+            # 1.  keep only the tuples we want to see
             # ------------------------------------------------------------------
-            type0_triples = []
-            logging.info("Selecting type_0 triples for visualization...")
+            type0_tuples = []
+            logging.info("Selecting type_0 tuples for visualization...")
             for it in test:
                 if it.get("type") == "type_0":
                     tr = parse(it["input_text"])
-                    assert tr not in train_triples, f"duplicate found: {tr!r}"
-                    type0_triples.append(tr)
+                    assert tr not in train_tuples, f"duplicate found: {tr!r}"
+                    type0_tuples.append(tr)
 
-            train_set = set(train_triples)
-            type0_set = set(type0_triples)
+            train_set = set(train_tuples)
+            type0_set = set(type0_tuples)
             
             # ------------------------------------------------------------------
             # 2.  build a *visualisation* graph on this subset (with caching)
             # ------------------------------------------------------------------
-            viz_triples = train_triples + type0_triples
+            viz_tuples = train_tuples + type0_tuples
             
             # Create cache directory if it doesn't exist
             cache_dir = os.path.join(args.data_dir, "cache")
@@ -476,7 +301,7 @@ def main():
                 logging.info(f"Loaded graph with |V|={G_viz.number_of_nodes()}, |E|={G_viz.number_of_edges()}")
             else:
                 logging.info("Building visualization graph (this may take a while)...")
-                G_viz = build_full_subst_graph(viz_triples, triple2t, equiv_classes)
+                G_viz = build_subst_graph(behavior_maps, viz_tuples, args.min_evidence, full_length=full_len)
                 
                 # Save to cache for future use
                 logging.info(f"Saving visualization graph to cache: {cache_file}")
@@ -520,7 +345,6 @@ def main():
                         )
                         
                         # Compute layout with progress indication
-                        from tqdm import tqdm
                         logging.info("Computing ForceAtlas2 layout...")
                         pos = {}
                         iterations = 500
@@ -565,7 +389,7 @@ def main():
 
             # Process nodes in batches to avoid memory issues with large graphs
             BATCH_SIZE = 5000
-            node_batches = [list(G_viz.nodes())[i:i+BATCH_SIZE] 
+            node_batches = [list(G_viz.nodes())[i:i+BATCH_SIZE]
                         for i in range(0, len(G_viz.nodes()), BATCH_SIZE)]
             
             for batch in node_batches:
@@ -575,7 +399,7 @@ def main():
                         continue
                         
                     x, y = pos[n]
-                    txt = str((*n, triple2t[n]))
+                    txt = str((*n, tuple2t[n]))
 
                     if n in train_set:
                         label = "train (covered)"
@@ -623,7 +447,6 @@ def main():
             edge_batches = [edge_list[i:i+EDGE_BATCH_SIZE] 
                         for i in range(0, len(edge_list), EDGE_BATCH_SIZE)]
             
-            from tqdm import tqdm
             for batch in tqdm(edge_batches, desc="Processing edge batches"):
                 batch_x, batch_y = [], []
                 for u, v in batch:
